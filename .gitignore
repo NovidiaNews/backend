@@ -1,0 +1,28 @@
+node_modules
+# Keep environment variables out of version control
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+
+/generated/prisma
+.qodo
+.vscode
+.idea
+dist
+docs
+logs
+node_modules
+prisma/migrations
+src/__tests__/__mocks__
+
+# Test files with potential secrets
+test-oauth2.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug logs
+*.log

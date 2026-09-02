@@ -1,0 +1,239 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String    @id @default(uuid())
+  username      String    @unique
+  email         String    @unique
+  password      String
+  firstName     String?
+  lastName      String?
+  consentToTOS  Boolean   @default(false)
+  role          Int       @default(1) // 1: Logged In, 10: Student, 20: Teacher, 30: School, 100: Admin
+  strikes       Int       @default(0)
+  isBanned      Boolean   @default(false)
+  unbanDate     DateTime?
+  
+  // Verification fields
+  isVerified             Boolean   @default(false)
+  verificationCode       String?
+  verificationCodeExpires DateTime?
+
+  // Onboarding fields
+  isOnboarded           Boolean   @default(false)
+  profilePicture        String?   // base64 data URL or path
+  backgroundPicture     String?   // banner (base64 data URL or CDN path)
+  bio                   String?
+  headline              String?   // e.g. "Redaktor naczelny"
+  location              String?
+  pronouns              String?
+  website               String?
+  socials               Json?     // { instagram?, twitter?, facebook?, discord? }
+  theme                 String    @default("dark") // light | dark | system
+  notificationsEnabled  Boolean   @default(true)
+
+  // Account status
+  isDisabled            Boolean   @default(false)
+  disabledAt            DateTime?
+
+  // Soft-delete fields
+  deletedAt              DateTime?
+  scheduledDeletionAt    DateTime?   // deletedAt + 7 days
+  deletionAskedAt        DateTime?   // when user requested deletion (for reminder scheduling)
+  deletionCode           String?     // restore code
+
+  articles      Article[] @relation("AuthorArticles")
+  schoolProfile SchoolProfile?
+  refreshTokens RefreshToken[]
+  banRecords    BanRecord[]
+  userDevices   UserDevice[]
+  linkedAccounts LinkedAccount[]
+  knownIps     KnownIp[]
+  createdAt     DateTime  @default(now())
+
+  @@index([isBanned])
+}
+
+model LinkedAccount {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider   String   // google | discord | facebook | apple
+  providerId String
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  tokenHash   String   @unique
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent   String?
+  ipAddress   String?
+  fingerprint String?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+model BanRecord {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason      String
+  moderatorId String
+  expiresAt   DateTime?
+  appealStatus String   @default("NONE") // NONE, PENDING, APPROVED, REJECTED
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String
+  userId      String?
+  targetId    String?
+  details     Json?
+  ipAddress   String?
+  fingerprint String?
+  createdAt   DateTime @default(now())
+
+  @@index([action])
+  @@index([userId])
+}
+
+model UserDevice {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fingerprint String
+  ipAddress   String?
+  userAgent   String?
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, fingerprint])
+  @@index([fingerprint])
+}
+
+model Article {
+  id              String   @id @default(uuid())
+  title           String
+  content         String   @db.Text
+  history         Json     @default("[]") // [{ content: base64_gzip, timestamp: string }]
+  status          String   @default("DRAFT")
+  
+  authorId        String
+  author          User     @relation("AuthorArticles", fields:[authorId], references: [id])
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model PendingUser {
+  id                      String   @id @default(uuid())
+  username                String   @unique
+  email                   String   @unique
+  password                String
+  firstName               String?
+  lastName                String?
+  consentToTOS            Boolean  @default(false)
+  verificationCode        String
+  verificationCodeExpires DateTime
+  createdAt               DateTime @default(now())
+}
+
+model PendingSchool {
+  id                      String   @id @default(uuid())
+  email                   String   @unique
+  password                String
+  schoolName              String
+  phoneNumber             String?
+  city                    String?
+  address                 String?
+  postalCode              String?
+  rspoNumber              String?
+  website                 String?
+  voivodeship             String?
+  consentToTOS            Boolean  @default(false)
+  verificationCode        String
+  verificationCodeExpires DateTime
+  domainData              Json?
+  createdAt               DateTime @default(now())
+}
+
+model SchoolProfile {
+  id              String  @id @default(uuid())
+  schoolName      String
+  phoneNumber     String?
+  city            String?
+  address         String?
+  postalCode      String?
+  rspoNumber      String?
+  website         String?
+  voivodeship     String?
+  description     String?
+  logo            String?
+
+  userId          String  @unique
+  user            User    @relation(fields: [userId], references: [id])
+}
+
+model IpBan {
+  id        String    @id @default(uuid())
+  ip        String    @unique
+  reason    String
+  source    String    @default("manual") // manual | rate_limit
+  bannedBy  String?
+  expiresAt DateTime? // null = permanent
+  createdAt DateTime  @default(now())
+
+  @@index([expiresAt])
+}
+
+model Visit {
+  id        String   @id @default(uuid())
+  path      String
+  ipHash    String?
+  ipTruncated String?
+  country   String?
+  countryCode String?
+  region    String?
+  city      String?
+  timezone  String?
+  lat       Float?
+  lon       Float?
+  userAgent String?
+  userId    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([countryCode])
+}
+
+model KnownIp {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ipHash       String
+  ip           String?  // full IP, e.g. "149.22.88.136"
+  city         String?
+  country      String?
+  userAgent    String?
+  lastUsedAt   DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, ipHash])
+  @@index([userId])
+}

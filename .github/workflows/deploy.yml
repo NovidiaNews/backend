@@ -1,0 +1,78 @@
+name: Deploy Novidia Backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novidia-backend-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build backend
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Prepare production release
+        run: |
+          npm prune --omit=dev
+          mkdir -p release
+          cp -a dist release/dist
+          cp -a node_modules release/node_modules
+          cp package.json package-lock.json release/
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "$VPS_PORT" \
+            "novidia-backend-deploy@$VPS_HOST" \
+            'mkdir -p /home/novidia-backend-deploy/releases/current'
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519 -p $VPS_PORT" \
+            release/ \
+            "novidia-backend-deploy@$VPS_HOST:/home/novidia-backend-deploy/releases/current/"
+
+      - name: Deploy
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "$VPS_PORT" \
+            "novidia-backend-deploy@$VPS_HOST" \
+            'sudo -n /usr/local/sbin/novidia-deploy backend'

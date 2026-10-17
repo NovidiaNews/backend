@@ -6,6 +6,7 @@ import { sendVerificationEmail, sendIpVerificationEmail, sendDeletionRequestedEm
 import { isOwnerEmail } from '../lib/owners.js';
 import { hashIp } from '../lib/security.js';
 import { lookupIp } from '../lib/geo.js';
+import { computeAge, ageGroupFor, MIN_AGE_WITHOUT_GUARDIAN } from '../lib/age.js';
 
 // Timing-safe comparison for verification codes to prevent timing attacks
 function timingSafeCompare(a: string, b: string): boolean {
@@ -26,6 +27,13 @@ function resolveClientIp(request: any): string {
 const pendingIpVerifications = new Map<string, { ipHash: string; expiresAt: number; ip: string; geo: { city?: string | null; country?: string | null }; userAgent: string | null }>();
 
 const USERNAME_SCHEMA = z.string().min(3).max(32).regex(/^[a-zA-Z0-9_.]+$/, 'Nazwa użytkownika może zawierać tylko litery, cyfry, _ oraz .');
+
+// E-mail addresses are case-insensitive by definition. Always compare them
+// through this helper so typing "Jan@Szkola.edu.pl" still finds
+// "jan@szkola.edu.pl".
+const emailCond = (addr: unknown) => ({
+  email: { equals: String(addr ?? '').trim(), mode: 'insensitive' as const },
+});
 
 export default async function userRoutes(fastify: FastifyInstance) {
   // Generate cryptographically-secure random 6-digit verification code
@@ -50,29 +58,24 @@ export default async function userRoutes(fastify: FastifyInstance) {
       rateLimit: { max: 5, timeWindow: '15 minutes' },
     },
     schema: {
+      // Step 1 of signup only asks for an e-mail + username. Password, date of
+      // birth and TOS consent are collected after e-mail verification.
       body: z.object({
         username: USERNAME_SCHEMA,
         email: z.string().email(),
-        password: z.string().min(8).max(128),
-        firstName: z.string().max(64).optional(),
-        lastName: z.string().max(64).optional(),
-        consentToTOS: z.boolean().optional(),
       }),
     },
   }, async (request, reply) => {
-    const { username, email, password, firstName, lastName, consentToTOS } = request.body as any;
-    // GDPR: consent must be explicit — never default to true
-    const consent = consentToTOS === true;
-    if (!consent) {
-      return reply.status(400).send({ message: 'Wymagana jest zgoda na Regulamin i Politykę prywatności.' });
-    }
+    const { username, email } = request.body as any;
+    // Normalise e-mails once, at the source, so everything downstream matches.
+    const normalizedEmail = String(email).trim().toLowerCase();
 
     try {
-      // 1. Check if user already exists in User table
+      // 1. Check if user already exists in User table (e-mail case-insensitive)
       const existingUser = await fastify.prisma.user.findFirst({
         where: {
           OR: [
-            { email },
+            { email: { equals: normalizedEmail, mode: 'insensitive' } },
             { username },
           ]
         }
@@ -86,41 +89,40 @@ export default async function userRoutes(fastify: FastifyInstance) {
       await fastify.prisma.pendingUser.deleteMany({
         where: {
           OR: [
-            { email },
+            { email: { equals: normalizedEmail, mode: 'insensitive' } },
             { username },
           ]
         }
       });
 
-      const hashed = await hashPassword(password);
       const code = generateVerificationCode();
       const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
-      // 3. Create pending user record
+      // Step 1 only collects e-mail + username. Password and consent are
+      // captured later (complete-registration), so nothing sensitive is
+      // stored before the address is proven.
       await fastify.prisma.pendingUser.create({
         data: {
           username,
-          email,
-          password: hashed,
-          firstName,
-          lastName,
-          consentToTOS: consent,
+          email: normalizedEmail,
           verificationCode: code,
           verificationCodeExpires: expires,
         }
       });
 
-      // Send verification email
-      await sendVerificationEmail(email, code);
+      // Send verification email — surface a clear error instead of silently
+      // pretending the e-mail went out (and leaving the user stuck).
+      const sent = await sendVerificationEmail(email, code);
+      if (!sent) {
+        return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+      }
 
       return {
         status: 'needs_verification',
-        message: 'Account created. Verification email sent.',
+        message: 'Kod weryfikacyjny został wysłany na podany adres e-mail.',
         user: {
           username,
           email,
-          firstName,
-          lastName,
           isVerified: false,
           isOnboarded: false,
         },
@@ -148,9 +150,9 @@ export default async function userRoutes(fastify: FastifyInstance) {
   }, async (request, reply) => {
     const { email, code } = request.body as any;
 
-    // 1. Check if the user is already verified in User table
-    const existingUser = await fastify.prisma.user.findUnique({
-      where: { email },
+    // 1. Check if the user is already verified in User table (case-insensitive)
+    const existingUser = await fastify.prisma.user.findFirst({
+      where: emailCond(email),
     });
 
     if (existingUser) {
@@ -173,9 +175,9 @@ export default async function userRoutes(fastify: FastifyInstance) {
       };
     }
 
-    // 2. Look up the pending user registration
-    const pendingUser = await fastify.prisma.pendingUser.findUnique({
-      where: { email },
+    // 2. Look up the pending user registration (case-insensitive)
+    const pendingUser = await fastify.prisma.pendingUser.findFirst({
+      where: emailCond(email),
     });
 
     if (!pendingUser) {
@@ -190,17 +192,16 @@ export default async function userRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ message: 'Kod weryfikacyjny wygasł (jest ważny tylko przez 15 minut).' });
     }
 
-    // 3. Email is verified! Create the user record in the main User table
+    // 3. Email is verified! Create the user record in the main User table.
+    // The password is set later in complete-registration; until then the
+    // account is protected by an unusable random hash.
     const user = await fastify.prisma.user.create({
       data: {
         username: pendingUser.username,
         email: pendingUser.email,
-        password: pendingUser.password,
-        firstName: pendingUser.firstName,
-        lastName: pendingUser.lastName,
-        consentToTOS: pendingUser.consentToTOS,
+        password: pendingUser.password ?? (await hashPassword(crypto.randomBytes(32).toString('hex'))),
         role: isOwnerEmail(pendingUser.email) ? 100 : undefined,
-        isVerified: true, // Mark verified directly
+        isVerified: true,
         isOnboarded: false,
       },
       select: {
@@ -212,6 +213,8 @@ export default async function userRoutes(fastify: FastifyInstance) {
         lastName: true,
         isVerified: true,
         isOnboarded: true,
+        consentToTOS: true,
+        ageGroup: true,
         createdAt: true,
       },
     });
@@ -225,10 +228,127 @@ export default async function userRoutes(fastify: FastifyInstance) {
     setAuthCookie(reply, token);
 
     return {
-      status: 'needs_onboarding', // New users need onboarding
+      status: 'needs_registration', // Set password + date of birth next
       message: 'E-mail został pomyślnie zweryfikowany.',
       user,
       token,
+    };
+  });
+
+  // Complete Registration (Authenticated) — password + date of birth + TOS.
+  // Collected AFTER e-mail verification so a stolen/typo'd address can't be
+  // used to create a fully-formed account.
+  fastify.post('/complete-registration', {
+    preHandler: [fastify.authenticate],
+    schema: {
+      body: z.object({
+        password: z.string().min(8).max(128),
+        birthDate: z.string(),
+        consentToTOS: z.boolean(),
+        guardianEmail: z.string().email().optional(),
+      }),
+    },
+  }, async (request, reply) => {
+    const currentUser = request.user as any;
+    const { password, birthDate, consentToTOS, guardianEmail } = request.body as any;
+
+    // GDPR: consent must be explicit — never default to true
+    if (consentToTOS !== true) {
+      return reply.status(400).send({ message: 'Wymagana jest zgoda na Regulamin i Politykę prywatności.' });
+    }
+
+    const dob = new Date(birthDate);
+    const now = new Date();
+    if (Number.isNaN(dob.getTime()) || dob.getTime() > now.getTime() || dob.getUTCFullYear() < 1900) {
+      return reply.status(400).send({ message: 'Nieprawidłowa data urodzenia.' });
+    }
+
+    const age = computeAge(dob, now);
+    let restricted = false;
+    let normalizedGuardian: string | null = null;
+
+    // Under-13: a guardian e-mail is required and the account is restricted.
+    if (age < MIN_AGE_WITHOUT_GUARDIAN) {
+      if (!guardianEmail || !z.string().email().safeParse(guardianEmail).success) {
+        return reply.status(400).send({
+          message: 'Osoby poniżej 13. roku życia muszą podać adres e-mail opiekuna prawnego.',
+          requiresGuardian: true,
+        });
+      }
+      const me = await fastify.prisma.user.findUnique({ where: { id: currentUser.id }, select: { email: true } });
+      if (me && guardianEmail.toLowerCase() === me.email.toLowerCase()) {
+        return reply.status(400).send({ message: 'Adres e-mail opiekuna musi być inny niż Twoje konto.' });
+      }
+      restricted = true;
+      normalizedGuardian = guardianEmail.toLowerCase();
+    }
+
+    const hashedPassword = await hashPassword(password);
+
+    const user = await fastify.prisma.user.update({
+      where: { id: currentUser.id },
+      data: {
+        password: hashedPassword,
+        birthDate: dob,
+        ageGroup: ageGroupFor(age),
+        consentToTOS: true,
+        guardianEmail: normalizedGuardian,
+        isRestricted: restricted,
+        isOnboarded: true,
+        verificationCode: null,
+        verificationCodeExpires: null,
+      },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        role: true,
+        firstName: true,
+        lastName: true,
+        isVerified: true,
+        isOnboarded: true,
+        profilePicture: true,
+        consentToTOS: true,
+        ageGroup: true,
+        isRestricted: true,
+        createdAt: true,
+      },
+    });
+
+    return {
+      status: 'success',
+      message: 'Rejestracja została ukończona.',
+      user,
+    };
+  });
+
+  // Public, advertiser-facing profile. Exposes ONLY the coarse age group and,
+  // when the user explicitly opted in, the day + month of their birthday.
+  // The birth YEAR is never exposed under any circumstances.
+  fastify.get('/public/:id', {
+    config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    schema: { params: z.object({ id: z.string() }) },
+  }, async (request, reply) => {
+    const { id } = request.params as any;
+    const user = await fastify.prisma.user.findUnique({
+      where: { id },
+      select: {
+        username: true,
+        firstName: true,
+        birthDate: true,
+        birthDayMonthPublic: true,
+        ageGroup: true,
+      },
+    });
+    if (!user) return reply.status(404).send({ message: 'Nie znaleziono.' });
+
+    return {
+      username: user.username,
+      displayName: user.firstName || user.username,
+      ageGroup: user.ageGroup,
+      birthday: user.birthDayMonthPublic && user.birthDate
+        ? { day: user.birthDate.getUTCDate(), month: user.birthDate.getUTCMonth() + 1 }
+        : null,
     };
   });
 
@@ -245,18 +365,18 @@ export default async function userRoutes(fastify: FastifyInstance) {
   }, async (request, reply) => {
     const { email } = request.body as any;
 
-    // Check if the user is already verified and in the User table
-    const existingUser = await fastify.prisma.user.findUnique({
-      where: { email },
+    // Check if the user is already verified and in the User table (case-insensitive)
+    const existingUser = await fastify.prisma.user.findFirst({
+      where: emailCond(email),
     });
 
     if (existingUser) {
       return reply.status(400).send({ message: 'Ten e-mail jest już zweryfikowany.' });
     }
 
-    // Look up the pending registration
-    const pendingUser = await fastify.prisma.pendingUser.findUnique({
-      where: { email },
+    // Look up the pending registration (case-insensitive)
+    const pendingUser = await fastify.prisma.pendingUser.findFirst({
+      where: emailCond(email),
     });
 
     if (!pendingUser) {
@@ -274,7 +394,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
       },
     });
 
-    await sendVerificationEmail(email, code);
+    const sent = await sendVerificationEmail(email, code);
+    if (!sent) {
+      return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+    }
 
     return {
       status: 'success',
@@ -297,11 +420,16 @@ export default async function userRoutes(fastify: FastifyInstance) {
     const { login, password } = request.body as any;
 
     // Check User table first
+    // E-mail addresses are case-insensitive by definition; usernames keep
+    // their exact spelling. Trim + case-fold only the e-mail side so
+    // "Jan@Szkola.edu.pl" logs into "jan@szkola.edu.pl".
+    const loginRaw = typeof login === 'string' ? login.trim() : '';
+
     const user = await fastify.prisma.user.findFirst({
       where: {
         OR: [
-          { email: login },
-          { username: login },
+          { email: { equals: loginRaw, mode: 'insensitive' } },
+          { username: loginRaw },
         ],
       },
     });
@@ -311,14 +439,19 @@ export default async function userRoutes(fastify: FastifyInstance) {
       const pendingUser = await fastify.prisma.pendingUser.findFirst({
         where: {
           OR: [
-            { email: login },
-            { username: login },
+            { email: { equals: loginRaw, mode: 'insensitive' } },
+            { username: loginRaw },
           ],
         },
       });
 
       if (!pendingUser) {
         return reply.status(401).send({ message: 'Nieprawidłowy login lub hasło.' });
+      }
+
+      // Step-1 pending accounts have no password yet — tell the user to verify.
+      if (!pendingUser.password) {
+        return reply.status(400).send({ message: 'Rejestracja nie została ukończona. Sprawdź skrzynkę e-mail, aby zweryfikować konto.' });
       }
 
       // Verify password from PendingUser
@@ -339,7 +472,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
         },
       });
 
-      await sendVerificationEmail(pendingUser.email, code);
+      const sentPending = await sendVerificationEmail(pendingUser.email, code);
+      if (!sentPending) {
+        return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+      }
 
       return {
         status: 'needs_verification',
@@ -400,6 +536,13 @@ export default async function userRoutes(fastify: FastifyInstance) {
       where: { userId_ipHash: { userId: user.id, ipHash } },
     });
 
+    if (knownIp) {
+      // Keep "last seen" fresh so the admin dashboard reports the real last IP.
+      await fastify.prisma.knownIp
+        .update({ where: { id: knownIp.id }, data: { lastUsedAt: new Date() } })
+        .catch(() => {});
+    }
+
     if (!knownIp) {
       // New IP — send verification code, don't issue token yet
       const code = generateVerificationCode();
@@ -416,7 +559,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
       for (const [key, val] of pendingIpVerifications) {
         if (val.expiresAt < now) pendingIpVerifications.delete(key);
       }
-      await sendIpVerificationEmail(user.email, code, resolvedIp, geoData);
+      const sentIp = await sendIpVerificationEmail(user.email, code, resolvedIp, geoData);
+      if (!sentIp) {
+        return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+      }
       return {
         status: 'needs_ip_verification',
         message: 'Wykryto logowanie z nowego adresu IP. Kod weryfikacyjny został wysłany.',
@@ -448,6 +594,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
       theme: user.theme,
       notificationsEnabled: user.notificationsEnabled,
       isDisabled: user.isDisabled,
+      consentToTOS: user.consentToTOS,
+      ageGroup: user.ageGroup,
+      isRestricted: user.isRestricted,
+      accentColor: user.accentColor,
     };
 
     if (!user.isOnboarded) {
@@ -508,6 +658,8 @@ export default async function userRoutes(fastify: FastifyInstance) {
         bio: true,
         theme: true,
         notificationsEnabled: true,
+        consentToTOS: true,
+        ageGroup: true,
       },
     });
 
@@ -591,9 +743,17 @@ export default async function userRoutes(fastify: FastifyInstance) {
         website: true,
         socials: true,
         theme: true,
+        accentColor: true,
         notificationsEnabled: true,
         isDisabled: true,
         disabledAt: true,
+        consentToTOS: true,
+        ageGroup: true,
+        birthDate: true,
+        birthDayMonthPublic: true,
+        isRestricted: true,
+        guardianEmail: true,
+        guardianEmailVerified: true,
         createdAt: true,
         linkedAccounts: {
           select: { id: true, provider: true, providerId: true, createdAt: true },
@@ -670,6 +830,9 @@ export default async function userRoutes(fastify: FastifyInstance) {
     if (dbUser.role >= 100) {
       return reply.status(403).send({ message: 'Nie można wyłączyć konta właściciela serwisu.' });
     }
+    if (dbUser.isRestricted) {
+      return reply.status(403).send({ message: 'Konta osób poniżej 13. roku życia nie mogą być wyłączane samodzielnie.' });
+    }
 
     await fastify.prisma.user.update({
       where: { id: currentUser.id },
@@ -745,6 +908,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
         socials: z.record(z.string(), z.string()).nullable().optional(),
         theme: z.enum(['light', 'dark', 'system']).optional(),
         notificationsEnabled: z.boolean().optional(),
+        birthDayMonthPublic: z.boolean().optional(),
+        accentColor: z.string().regex(/^#[0-9a-fA-F]{6}(\s*,\s*#[0-9a-fA-F]{6}){0,3}$/, 'Kolor musi być w formacie #rrggbb lub gradient #rrggbb,#rrggbb.').nullable().optional(),
+        birthDate: z.string().optional(),
+        guardianEmail: z.string().email().optional(),
       }),
     },
   }, async (request, reply) => {
@@ -754,7 +921,7 @@ export default async function userRoutes(fastify: FastifyInstance) {
       username, email, password, currentPassword,
       firstName, lastName, consentToTOS,
       profilePicture, backgroundPicture, bio, headline, location, pronouns, website, socials,
-      theme, notificationsEnabled,
+      theme, notificationsEnabled, birthDayMonthPublic, accentColor, birthDate, guardianEmail,
     } = request.body as any;
     
     if (currentUser.id !== id) {
@@ -778,6 +945,34 @@ export default async function userRoutes(fastify: FastifyInstance) {
       }
     }
     
+    // Restricted (under-13) accounts may not change dangerous settings.
+    const restrictionCheck = await fastify.prisma.user.findUnique({ where: { id }, select: { isRestricted: true } });
+    if (restrictionCheck?.isRestricted) {
+      if (email !== undefined) {
+        return reply.status(403).send({ message: 'Konta osób poniżej 13. roku życia nie mogą zmieniać adresu e-mail.' });
+      }
+      if (birthDayMonthPublic === true) {
+        return reply.status(403).send({ message: 'Ta opcja jest niedostępna dla kont osób poniżej 13. roku życia.' });
+      }
+    }
+
+    // Self-service date of birth (used by the "complete your profile" popup).
+    let birthDateValue: Date | undefined;
+    if (birthDate !== undefined) {
+      const parsed = new Date(birthDate);
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() > Date.now()) {
+        return reply.status(400).send({ message: 'Nieprawidłowa data urodzenia.' });
+      }
+      // Under-13 accounts must have a guardian on file.
+      if (computeAge(parsed) < MIN_AGE_WITHOUT_GUARDIAN && !guardianEmail) {
+        return reply.status(400).send({
+          message: 'Osoby poniżej 13. roku życia muszą podać adres e-mail opiekuna prawnego.',
+          requiresGuardian: true,
+        });
+      }
+      birthDateValue = parsed;
+    }
+
     const data: any = {};
     if (username) data.username = username;
     if (email) data.email = email;
@@ -794,6 +989,17 @@ export default async function userRoutes(fastify: FastifyInstance) {
     if (socials !== undefined) data.socials = socials;
     if (theme !== undefined) data.theme = theme;
     if (typeof notificationsEnabled !== 'undefined') data.notificationsEnabled = notificationsEnabled;
+    if (typeof birthDayMonthPublic !== 'undefined') data.birthDayMonthPublic = birthDayMonthPublic;
+    if (accentColor !== undefined) data.accentColor = accentColor;
+    if (birthDateValue) {
+      data.birthDate = birthDateValue;
+      const age = computeAge(birthDateValue);
+      data.ageGroup = ageGroupFor(age);
+      if (age < MIN_AGE_WITHOUT_GUARDIAN) {
+        data.isRestricted = true;
+        if (guardianEmail) data.guardianEmail = guardianEmail.trim().toLowerCase();
+      }
+    }
     if (password) {
       data.password = await hashPassword(password);
     }
@@ -820,8 +1026,20 @@ export default async function userRoutes(fastify: FastifyInstance) {
           website: true,
           socials: true,
           theme: true,
+          // Everything the client merges into its cached `novidia_user` — a
+          // field missing here survives from the previous copy, so the stale
+          // accentColor used to be pushed back onto the UI after every save.
+          accentColor: true,
+          consentToTOS: true,
+          ageGroup: true,
+          isRestricted: true,
+          birthDate: true,
+          birthDayMonthPublic: true,
+          guardianEmail: true,
+          guardianEmailVerified: true,
           notificationsEnabled: true,
           isDisabled: true,
+          disabledAt: true,
           createdAt: true,
           linkedAccounts: {
             select: { id: true, provider: true, providerId: true, createdAt: true },
@@ -860,6 +1078,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
     const user = await fastify.prisma.user.findUnique({ where: { id } });
     if (!user) {
       return reply.status(404).send({ message: 'Konto nie istnieje.' });
+    }
+
+    if (user.isRestricted) {
+      return reply.status(403).send({ message: 'Konta osób poniżej 13. roku życia nie mogą być usuwane samodzielnie. Skontaktuj się z opiekunem.' });
     }
 
     // Verify password
@@ -917,7 +1139,7 @@ export default async function userRoutes(fastify: FastifyInstance) {
   }, async (request, reply) => {
     const { email, code } = request.body as any;
 
-    const user = await fastify.prisma.user.findFirst({ where: { email } });
+    const user = await fastify.prisma.user.findFirst({ where: emailCond(email) });
     if (!user) {
       return reply.status(404).send({ message: 'Nie znaleziono konta.' });
     }
@@ -981,6 +1203,10 @@ export default async function userRoutes(fastify: FastifyInstance) {
       theme: user.theme,
       notificationsEnabled: user.notificationsEnabled,
       isDisabled: user.isDisabled,
+      consentToTOS: user.consentToTOS,
+      ageGroup: user.ageGroup,
+      isRestricted: user.isRestricted,
+      accentColor: user.accentColor,
     };
 
     return {

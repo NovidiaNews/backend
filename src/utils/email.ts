@@ -160,6 +160,21 @@ const EMAIL_TEMPLATE = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitiona
 </body>
 </html>`;
 
+/**
+ * Verify the SMTP connection at boot so misconfiguration is logged early
+ * instead of surfacing as a failed signup much later. Never throws.
+ */
+export async function verifySmtp(): Promise<boolean> {
+  if (!transporter) return false;
+  try {
+    await transporter.verify();
+    return true;
+  } catch (error) {
+    console.error('[SMTP] Verification failed:', (error as Error)?.message || error);
+    return false;
+  }
+}
+
 export async function sendVerificationEmail(email: string, code: string): Promise<boolean> {
   const html = EMAIL_TEMPLATE.replace('{{CODE}}', code);
   
@@ -429,6 +444,90 @@ export async function sendAccountDeletedFinalEmail(email: string): Promise<boole
     return true;
   } catch (error) {
     console.error('Error sending final deletion email:', error);
+    return false;
+  }
+}
+
+// ── Support e-mail ──────────────────────────────────────────────────────────
+const escapeHtml = (value: string): string =>
+  value.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      default: return '&#39;';
+    }
+  });
+
+function actionButtonHtml(label: string, link: string): string {
+  return `
+    <tr>
+      <td align="center" style="padding-bottom: 32px;">
+        <table border="0" cellpadding="0" cellspacing="0">
+          <tr>
+            <td align="center" bgcolor="#36316A" style="border-radius: 12px;">
+              <a href="${link}" target="_blank" style="display: inline-block; padding: 14px 32px; font-family: Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; color: #ffffff; text-decoration: none;">
+                ${escapeHtml(label)}
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+}
+
+export async function sendSupportMessageEmail(
+  email: string,
+  opts: { ticketSubject: string; message: string; agentName?: string; ticketLink: string },
+): Promise<boolean> {
+  const agent = opts.agentName || 'Zespół supportu Novidia';
+  const bodyHtml = `
+    <tr>
+      <td align="left" class="font-body" style="font-family: Helvetica, Arial, sans-serif; font-size: 16px; font-weight: 400; line-height: 24px; color: #52525b; padding-bottom: 16px;">
+        Otrzymałeś nową wiadomość od supportu w zgłoszeniu <strong>${escapeHtml(opts.ticketSubject)}</strong>.
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="padding-bottom: 16px;">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f4f4f5; border-radius: 12px; border-left: 4px solid #36316A;">
+          <tr>
+            <td style="padding: 20px 24px; font-family: Helvetica, Arial, sans-serif; font-size: 14px; line-height: 22px; color: #3f3f46; white-space: pre-wrap;">${escapeHtml(opts.message)}</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td align="left" class="font-body" style="font-family: Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; line-height: 20px; color: #52525b; padding-bottom: 8px;">
+        ${escapeHtml(agent)}
+      </td>
+    </tr>
+    ${actionButtonHtml('Odpowiedz w zgłoszeniu', opts.ticketLink)}
+    <tr>
+      <td align="left" class="font-body" style="font-family: Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 400; line-height: 20px; color: #71717a; padding-bottom: 32px;">
+        Odpowiadając w panelu zgłoszeń, wiadomość trafi bezpośrednio do naszego zespołu.
+      </td>
+    </tr>`;
+
+  const html = DELETION_EMAIL_TEMPLATE(bodyHtml);
+  const text = `Nowa wiadomość od supportu w zgłoszeniu "${opts.ticketSubject}":\n\n${opts.message}\n\n${agent}\nOdpowiedz: ${opts.ticketLink}`;
+
+  if (!transporter) {
+    console.log(`[SMTP SIMULATOR] Support reply for ${email} on "${opts.ticketSubject}": ${opts.message}`);
+    return true;
+  }
+
+  try {
+    await transporter.sendMail({
+      from: smtpFrom,
+      to: email,
+      subject: `Nowa wiadomość od supportu: ${opts.ticketSubject} - Novidia`,
+      html,
+      text,
+    });
+    return true;
+  } catch (error) {
+    console.error('Error sending support email:', error);
     return false;
   }
 }

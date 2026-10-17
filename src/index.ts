@@ -12,13 +12,17 @@ import articleRoutes from './routes/articles.js';
 import userRoutes from './routes/users.js';
 import schoolRoutes from './routes/schools.js';
 import adminRoutes from './routes/admin.js';
+import adminSupportRoutes from './routes/adminSupport.js';
+import supportRoutes from './routes/support.js';
 import oauthPlugin from './routes/auth.js';
 import visitRoutes from './routes/visits.js';
 import eventRoutes from './routes/events.js';
 import { isIpBanned, banIp, isSensitivePath, recordSensitiveHit, purgeExpiredBanCache } from './lib/security.js';
 import { startDeletionScheduler } from './jobs/deletion-scheduler.js';
+import { verifySmtp } from './utils/email.js';
 import fs from 'fs/promises';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 // GDPR retention: visit/geodata is purged automatically after 90 days
 const VISIT_RETENTION_DAYS = Number(process.env.VISIT_RETENTION_DAYS) || 90;
@@ -43,17 +47,26 @@ try {
 
 const fastify = Fastify({
   logger: true,
+  // We emit our own request/response logs with full context below, so keep
+  // Fastify's built-in ones off to avoid duplicated/out-of-order entries.
+  disableRequestLogging: true,
+  genReqId: () => randomUUID(),
   bodyLimit: 1048576, // 1MB payload limit
   // Only trust X-Forwarded-For when explicitly behind a reverse proxy.
   // Keeps dev/test environments spoof-safe (loopback bypass and IP bans).
   trustProxy: process.env.TRUST_PROXY === 'true',
 }).withTypeProvider<ZodTypeProvider>();
 
+// The website origins are allowed to talk to this standalone API.
+// The API itself is served from its own host (production: api.novidia.eu),
+// but requests still originate from the website, so those are the origins
+// that must be whitelisted. Extra origins can be appended via env.
 const ALLOWED_ORIGINS = [
   'https://novidia.eu',
   'https://www.novidia.eu',
   'http://localhost:4001',
   'http://localhost:3000',
+  ...(process.env.EXTRA_ALLOWED_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean) ?? []),
 ];
 
 // ---------------------------------------------------------------------------
@@ -87,7 +100,7 @@ const start = async () => {
           scriptSrc: ["'self'"],
           styleSrc: ["'self'", "'unsafe-inline'"],
           imgSrc: ["'self'", "data:", "https:"],
-          connectSrc: ["'self'", "http://localhost:3001", "http://localhost:4001"],
+          connectSrc: ["'self'", "https://api.novidia.eu", "https://novidia.eu", "https://www.novidia.eu", "http://localhost:3001", "http://localhost:4001"],
           fontSrc: ["'self'", "https:", "data:"],
           frameAncestors: ["'none'"],
           objectSrc: ["'none'"],
@@ -127,7 +140,9 @@ const start = async () => {
     await fastify.register(articleRoutes, { prefix: '/articles' });
     await fastify.register(userRoutes, { prefix: '/users' });
     await fastify.register(schoolRoutes, { prefix: '/schools' });
+    await fastify.register(supportRoutes, { prefix: '/support' });
     await fastify.register(adminRoutes, { prefix: '/admin' });
+    await fastify.register(adminSupportRoutes, { prefix: '/admin' });
     await fastify.register(visitRoutes);
     await fastify.register(eventRoutes);
 
@@ -210,14 +225,25 @@ import { addLog } from './lib/logBuffer.js';
   };
 });
 
-// Capture request/response lifecycle and errors with extensive details
+// Capture request/response lifecycle and errors with extensive details.
+// Fastify's built-in request logging is disabled above so every request is
+// logged exactly once here — correlated by request id, with colours by status.
+const isNoisyPath = (url: string) => {
+  const p = url.split('?')[0];
+  return p === '/health' || p === '/favicon.ico';
+};
+
 fastify.addHook('onRequest', (request, reply, done) => {
   try {
+    if (isNoisyPath(request.url)) { done(); return; }
     const ip = request.ip;
     const userAgent = request.headers['user-agent'] || 'unknown';
     const origin = request.headers['origin'] || request.headers['referer'] || 'direct';
     const query = Object.keys(request.query || {}).length > 0 ? JSON.stringify(request.query) : 'none';
-    const msg = `[Request] Incoming: ${request.method} ${request.url} | IP: ${ip} | Origin: ${origin} | User-Agent: ${userAgent} | QueryParams: ${query}`;
+    const auth = request.headers.authorization ? 'bearer' : 'none';
+    const contentType = request.headers['content-type'] || 'none';
+    const contentLength = request.headers['content-length'] || '0';
+    const msg = `[Request] #${request.id} ${request.method} ${request.url} | IP: ${ip} | Origin: ${origin} | Auth: ${auth} | Content-Type: ${contentType} | Length: ${contentLength} | Query: ${query} | UA: ${userAgent}`;
     addLog({ level: 'info', time: Date.now(), msg, pid: process.pid, url: request.url });
   } catch (e) {}
   done();
@@ -225,10 +251,13 @@ fastify.addHook('onRequest', (request, reply, done) => {
 
 fastify.addHook('onResponse', (request, reply, done) => {
   try {
+    if (isNoisyPath(request.url)) { done(); return; }
     const duration = reply.elapsedTime ? `${reply.elapsedTime.toFixed(2)}ms` : 'unknown';
     const size = reply.getHeader('content-length') || 'unknown';
-    const msg = `[Response] Completed: ${request.method} ${request.url} -> Status: ${reply.statusCode} | Duration: ${duration} | Content-Length: ${size}`;
-    addLog({ level: 'info', time: Date.now(), msg, pid: process.pid, url: request.url });
+    const userId = (request as any).user?.id || 'anon';
+    const level = reply.statusCode >= 500 ? 'error' : reply.statusCode >= 400 ? 'warn' : 'info';
+    const msg = `[Response] #${request.id} ${request.method} ${request.url} -> ${reply.statusCode} | ${duration} | size: ${size} | user: ${userId}`;
+    addLog({ level, time: Date.now(), msg, pid: process.pid, url: request.url });
   } catch (e) {}
   done();
 });
@@ -236,7 +265,7 @@ fastify.addHook('onResponse', (request, reply, done) => {
 fastify.addHook('onError', (request, reply, error, done) => {
   try {
     const ip = request.ip;
-    const msg = `[Error] Failed: ${request.method} ${request.url} from IP: ${ip} -> Error: ${error.message} | Code: ${error.code || 'N/A'} | Stack: ${error.stack}`;
+    const msg = `[Error] #${request.id} ${request.method} ${request.url} from IP: ${ip} -> ${error.message} | Code: ${(error as any).code || 'N/A'} | Status: ${(error as any).statusCode || 500} | Stack: ${error.stack}`;
     addLog({ level: 'error', time: Date.now(), msg, pid: process.pid, url: request.url });
   } catch (e) {}
   done();
@@ -249,6 +278,7 @@ fastify.setSerializerCompiler(serializerCompiler);
 fastify.setErrorHandler((error: any, request, reply) => {
   request.log.error(error);
   if (error.validation) {
+    request.log.warn(`[Validation] #${request.id} ${request.method} ${request.url} failed: ${JSON.stringify(error.validation)}`);
     return reply.status(400).send({ error: 'Bad Request', message: 'Invalid request data' });
   }
   const statusCode = error.statusCode || 500;
@@ -327,6 +357,15 @@ fastify.addHook('onReady', async () => {
   };
   await purge().catch(() => {});
   setInterval(purge, 6 * 60 * 60 * 1000).unref();
+
+  // Verify the SMTP connection at boot so bad credentials are obvious in the
+  // logs instead of only showing up as a failed signup later.
+  const smtpOk = await verifySmtp();
+  if (smtpOk) {
+    fastify.log.info('[SMTP] Connection verified — transactional e-mail is ready.');
+  } else {
+    fastify.log.warn('[SMTP] Not configured or verification failed — verification e-mails will NOT be delivered.');
+  }
 
   // Start the deletion scheduler (soft-delete reminders + hard-delete)
   startDeletionScheduler(fastify.prisma);

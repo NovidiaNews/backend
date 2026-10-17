@@ -14,6 +14,23 @@ model User {
   firstName     String?
   lastName      String?
   consentToTOS  Boolean   @default(false)
+
+  // ── Date of birth (PRIVATE) ────────────────────────────────────────────
+  // The full date of birth is only ever returned to the account owner. It is
+  // never exposed publicly or through any advertiser-facing endpoint. The
+  // derived `ageGroup` is the only thing that may be shared (advertisers).
+  birthDate               DateTime?
+  ageGroup                String?   // e.g. "13-15", "26-30", "75+", "under13"
+  // Opt-in (explicit, fullscreen confirmation) to show DAY + MONTH publicly.
+  // The YEAR is never shown regardless of this flag.
+  birthDayMonthPublic     Boolean   @default(false)
+
+  // ── Under-13 protection ────────────────────────────────────────────────
+  // Users younger than 13 must provide a guardian e-mail and get restricted
+  // access to irreversible / dangerous account settings.
+  guardianEmail           String?
+  guardianEmailVerified   Boolean   @default(false)
+  isRestricted            Boolean   @default(false) // true while under 13
   role          Int       @default(1) // 1: Logged In, 10: Student, 20: Teacher, 30: School, 100: Admin
   strikes       Int       @default(0)
   isBanned      Boolean   @default(false)
@@ -35,6 +52,9 @@ model User {
   website               String?
   socials               Json?     // { instagram?, twitter?, facebook?, discord? }
   theme                 String    @default("dark") // light | dark | system
+  // Custom interface accent colour (Discord-style recolour of primary UI).
+  // Free for every account. "#rrggbb" or null for the default brand purple.
+  accentColor           String?
   notificationsEnabled  Boolean   @default(true)
 
   // Account status
@@ -54,6 +74,7 @@ model User {
   userDevices   UserDevice[]
   linkedAccounts LinkedAccount[]
   knownIps     KnownIp[]
+  tickets      Ticket[]
   createdAt     DateTime  @default(now())
 
   @@index([isBanned])
@@ -145,10 +166,12 @@ model PendingUser {
   id                      String   @id @default(uuid())
   username                String   @unique
   email                   String   @unique
-  password                String
+  // Password is now collected AFTER e-mail verification, so it starts empty.
+  password                String?
   firstName               String?
   lastName                String?
   consentToTOS            Boolean  @default(false)
+  guardianEmail           String?
   verificationCode        String
   verificationCodeExpires DateTime
   createdAt               DateTime @default(now())
@@ -215,6 +238,8 @@ model Visit {
   lat       Float?
   lon       Float?
   userAgent String?
+  // Rich device profile, collected ONLY with explicit analytics consent.
+  device    Json?
   userId    String?
   createdAt DateTime @default(now())
 
@@ -236,4 +261,62 @@ model KnownIp {
 
   @@unique([userId, ipHash])
   @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Support: customer tickets + user/content reports
+// ---------------------------------------------------------------------------
+
+model Ticket {
+  id            String    @id @default(uuid())
+  subject       String
+  category      String    @default("GENERAL") // GENERAL | ACCOUNT | BILLING | BUG | CONTENT | OTHER
+  status        String    @default("OPEN")    // OPEN | PENDING | RESOLVED | CLOSED
+  priority      String    @default("NORMAL")  // LOW | NORMAL | HIGH
+  assignedTo    String?
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastMessageAt DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  messages      TicketMessage[]
+
+  @@index([status])
+  @@index([userId])
+  @@index([lastMessageAt])
+}
+
+model TicketMessage {
+  id         String   @id @default(uuid())
+  ticketId   String
+  ticket     Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId   String?  // null for anonymised/system entries
+  authorType String   @default("user") // user | support
+  authorName String?
+  body       String   @db.Text
+  createdAt  DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+model Report {
+  id              String    @id @default(uuid())
+  type            String    // USER | CONTENT
+  reason          String
+  details         String?   @db.Text
+  status          String    @default("OPEN") // OPEN | REVIEWING | RESOLVED | DISMISSED
+  reporterId      String?
+  reporterUsername String?
+  targetUserId    String?
+  targetUsername  String?
+  contentId       String?
+  contentLabel    String?
+  resolution      String?   @db.Text
+  resolvedBy      String?
+  resolvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([status])
+  @@index([type])
+  @@index([targetUserId])
 }

@@ -3,11 +3,30 @@ import { z } from 'zod';
 import * as process from 'process';
 import * as argon2 from 'argon2';
 import * as os from 'os';
-import { banIp, unbanIp } from '../lib/security.js';
+import { banIp as banIpAddress, unbanIp } from '../lib/security.js';
 import { pushBanEvent } from './events.js';
 
 export default async function adminRoutes(fastify: FastifyInstance) {
   const authPre = [fastify.authenticate, fastify.requireRole(90)];
+
+  // ---------------------------------------------------------------------------
+  // Rank ("score") hierarchy.
+  //   100 = Owner, 90-99 = Administrator (e.g. 95), 30+ = Moderator/Editor...
+  // A member may NEVER act on an account ranked higher than their own — an
+  // administrator (95) must not be able to ban the owner (100).
+  // ---------------------------------------------------------------------------
+  function rankGuard(actorRole: number, targetRole: number): string | null {
+    if (targetRole >= 100 && actorRole < 100) {
+      return 'Nie możesz wykonywać akcji na kontach właściciela serwisu.';
+    }
+    if (targetRole > actorRole) {
+      return `Nie możesz wykonywać tej akcji: ranga celu (${targetRole}) jest wyższa od Twojej (${actorRole}).`;
+    }
+    if (targetRole >= 90 && actorRole < 100) {
+      return 'Tylko właściciel może wykonywać akcje na kontach administratorów.';
+    }
+    return null;
+  }
 
   const SYSTEM_STAT_SELECT = {
     id: true,
@@ -74,10 +93,22 @@ export default async function adminRoutes(fastify: FastifyInstance) {
         isOnboarded: true,
         isDisabled: true,
         createdAt: true,
-        userDevices: { orderBy: { lastSeenAt: 'desc' }, take: 1, select: { ipAddress: true, lastSeenAt: true } },
+        userDevices: { orderBy: { lastSeenAt: 'desc' }, take: 1, select: { ipAddress: true, lastSeenAt: true, userAgent: true } },
+        knownIps: { orderBy: { lastUsedAt: 'desc' }, take: 1, select: { ip: true, city: true, country: true, lastUsedAt: true, userAgent: true } },
       },
     });
-    return users.map((u) => ({ ...u, lastIp: u.userDevices[0]?.ipAddress || null }));
+    return users.map((u) => {
+      const known = u.knownIps[0];
+      const device = u.userDevices[0];
+      return {
+        ...u,
+        lastIp: known?.ip || device?.ipAddress || null,
+        lastSeenAt: known?.lastUsedAt || device?.lastSeenAt || null,
+        lastCity: known?.city || null,
+        lastCountry: known?.country || null,
+        lastUserAgent: known?.userAgent || device?.userAgent || null,
+      };
+    });
   });
 
   // Get single user
@@ -103,10 +134,17 @@ export default async function adminRoutes(fastify: FastifyInstance) {
         isDisabled: true,
         createdAt: true,
         userDevices: true,
+        knownIps: { orderBy: { lastUsedAt: 'desc' }, take: 10 },
       },
     });
     if (!user) return reply.status(404).send({ message: 'User not found' });
-    return user;
+    const lastKnown = user.knownIps[0];
+    const lastDevice = user.userDevices[0];
+    return {
+      ...user,
+      lastIp: lastKnown?.ip || lastDevice?.ipAddress || null,
+      lastSeenAt: lastKnown?.lastUsedAt || lastDevice?.lastSeenAt || null,
+    };
   });
 
   // Partial update user properties (legacy)
@@ -124,6 +162,14 @@ export default async function adminRoutes(fastify: FastifyInstance) {
   }, async (request, reply) => {
     const { id } = request.params as any;
     const data = request.body as any;
+    const currentUser = request.user as { id: string; role: number };
+
+    if (id !== currentUser.id) {
+      const target = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
+      if (!target) return reply.status(404).send({ message: 'User not found' });
+      const rankError = rankGuard(currentUser.role, target.role);
+      if (rankError) return reply.status(403).send({ message: rankError });
+    }
 
     const updatedUser = await fastify.prisma.user.update({
       where: { id },
@@ -159,25 +205,29 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     const currentUser = request.user as { id: string; role: number };
 
     const existingUser = await fastify.prisma.user.findUnique({ where: { id } });
-    if (!existingUser) return reply.status(404).send({ message: 'User not found' });
-
-    // Prevent role escalation: cannot promote others to role >= your own role
-    // Owner (100) bypasses all restrictions
-    if (currentUser.role < 100) {
-      if (body.role !== undefined && id !== currentUser.id && body.role >= currentUser.role) {
-        return reply.status(403).send({ message: 'Nie możesz nadać roli równej lub wyższej od własnej.' });
+    if (!existingUser) return reply.status(404).send({ message: 'User not found' });      // Prevent role escalation: cannot promote others to role >= your own role
+      // Owner (100) bypasses all restrictions
+      if (currentUser.role < 100) {
+        if (body.role !== undefined && id !== currentUser.id && body.role >= currentUser.role) {
+          return reply.status(403).send({ message: 'Nie możesz nadać roli równej lub wyższej od własnej.' });
+        }
+        // Prevent modifying the owner (role 100)
+        if (existingUser.role >= 100) {
+          return reply.status(403).send({ message: 'Nie możesz modyfikować właściciela serwisu.' });
+        }
       }
-      // Prevent modifying the owner (role 100)
-      if (existingUser.role >= 100) {
-        return reply.status(403).send({ message: 'Nie możesz modyfikować właściciela serwisu.' });
+      // Rank guard: a lower-ranked admin can never modify a higher-ranked one.
+      if (id !== currentUser.id) {
+        const rankError = rankGuard(currentUser.role, existingUser.role);
+        if (rankError) return reply.status(403).send({ message: rankError });
       }
-    }
 
     const allowedFields = [
       'username', 'email', 'firstName', 'lastName', 'role',
       'strikes', 'isBanned', 'unbanDate', 'isVerified',
       'isOnboarded', 'profilePicture', 'bio', 'theme',
       'notificationsEnabled', 'consentToTOS',
+      'isDisabled', 'isRestricted', 'accentColor', 'ageGroup',
     ] as const;
 
     const updateData: Record<string, unknown> = {};
@@ -221,12 +271,15 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     schema: { params: z.object({ id: z.string() }) },
   }, async (request, reply) => {
     const { id } = request.params as any;
-    const currentUser = request.user as { id: string };
+    const currentUser = request.user as { id: string; role: number };
     if (id === currentUser.id) {
       return reply.status(403).send({ message: 'Nie możesz usunąć własnego konta.' });
     }
-    const user = await fastify.prisma.user.findUnique({ where: { id } });
+    const user = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
     if (!user) return reply.status(404).send({ message: 'User not found' });
+
+    const rankError = rankGuard(currentUser.role, user.role);
+    if (rankError) return reply.status(403).send({ message: rankError });
 
     await fastify.prisma.article.deleteMany({ where: { authorId: id } });
     await fastify.prisma.user.delete({ where: { id } });
@@ -324,18 +377,15 @@ export default async function adminRoutes(fastify: FastifyInstance) {
       where: { id },
       include: {
         userDevices: { orderBy: { lastSeenAt: 'desc' }, take: 1, select: { ipAddress: true } },
+        knownIps: { orderBy: { lastUsedAt: 'desc' }, take: 1, select: { ip: true } },
       },
     });
     if (!user) return reply.status(404).send({ message: 'User not found' });
     if (user.id === actor.id) {
       return reply.status(403).send({ message: 'Nie możesz zbanować samego siebie.' });
     }
-    if (user.role >= 100) {
-      return reply.status(403).send({ message: 'Nie możesz zbanować właściciela serwisu.' });
-    }
-    if (user.role >= 90 && actor.role < 100) {
-      return reply.status(403).send({ message: 'Nie możesz zbanować administratora — tylko właściciel.' });
-    }
+    const rankError = rankGuard(actor.role, user.role);
+    if (rankError) return reply.status(403).send({ message: rankError });
 
     await fastify.prisma.user.update({
       where: { id },
@@ -348,9 +398,10 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     pushBanEvent(user.id, reason || null);
 
     let bannedIp: string | null = null;
-    if (banIp && user.userDevices[0]?.ipAddress) {
-      bannedIp = user.userDevices[0].ipAddress;
-      await banIp(fastify, bannedIp, reason || `Ban powiązany z kontem: ${user.username}`, 'manual', currentUser.id);
+    const targetIp = user.userDevices[0]?.ipAddress || user.knownIps[0]?.ip || null;
+    if (banIp && targetIp) {
+      bannedIp = targetIp;
+      await banIpAddress(fastify, bannedIp, reason || `Ban powiązany z kontem: ${user.username}`, 'manual', currentUser.id);
     }
 
     return { success: true, bannedIp };
@@ -362,6 +413,13 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     schema: { params: z.object({ id: z.string() }) },
   }, async (request, reply) => {
     const { id } = request.params as any;
+    const currentUser = request.user as { id: string; role: number };
+    const target = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
+    if (!target) return reply.status(404).send({ message: 'User not found' });
+    if (target.id !== currentUser.id) {
+      const rankError = rankGuard(currentUser.role, target.role);
+      if (rankError) return reply.status(403).send({ message: rankError });
+    }
     await fastify.prisma.user.update({
       where: { id },
       data: { isBanned: false, unbanDate: null },
@@ -375,8 +433,13 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     schema: { params: z.object({ id: z.string() }) },
   }, async (request, reply) => {
     const { id } = request.params as any;
-    const user = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, isVerified: true } });
+    const currentUser = request.user as { id: string; role: number };
+    const user = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, isVerified: true, role: true } });
     if (!user) return reply.status(404).send({ message: 'User not found' });
+    if (user.id !== currentUser.id) {
+      const rankError = rankGuard(currentUser.role, user.role);
+      if (rankError) return reply.status(403).send({ message: rankError });
+    }
 
     const updated = await fastify.prisma.user.update({
       where: { id },
@@ -400,6 +463,11 @@ export default async function adminRoutes(fastify: FastifyInstance) {
 
     const targetUser = await fastify.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
     if (!targetUser) return reply.status(404).send({ message: 'User not found' });
+
+    if (targetUser.id !== currentUser.id) {
+      const rankError = rankGuard(currentUser.role, targetUser.role);
+      if (rankError) return reply.status(403).send({ message: rankError });
+    }
 
     // Only owner (100) can promote to 100 or change other owners
     if (role >= 100 && currentUser.role < 100) {
@@ -596,7 +664,7 @@ export default async function adminRoutes(fastify: FastifyInstance) {
     const { ip, reason, expiresMinutes } = request.body as any;
     const currentUser = request.user as { id: string };
     const expiresAt = expiresMinutes ? new Date(Date.now() + expiresMinutes * 60_000) : null;
-    await banIp(fastify, ip, reason, 'manual', currentUser.id, expiresAt);
+    await banIpAddress(fastify, ip, reason, 'manual', currentUser.id, expiresAt);
     return { success: true };
   });
 

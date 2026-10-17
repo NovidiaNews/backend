@@ -21,7 +21,7 @@ interface OAuthProfile {
 const isProd = process.env.NODE_ENV === 'production';
 const CALLBACK_URL =
   process.env.OAUTH_CALLBACK_URL ||
-  (isProd ? 'https://novidia.eu/api' : 'http://localhost:3001');
+  (isProd ? 'https://api.novidia.eu' : 'http://localhost:3001');
 const FRONTEND_URL =
   process.env.FRONTEND_URL ||
   (isProd ? 'https://novidia.eu' : 'http://localhost:4001');

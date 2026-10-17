@@ -14,6 +14,9 @@ export default async function visitRoutes(fastify: FastifyInstance) {
     schema: {
       body: z.object({
         path: z.string().max(500),
+        // Optional rich device profile — only ever present when the visitor
+        // granted analytics consent (enforced below before anything is stored).
+        device: z.record(z.string(), z.any()).optional(),
       }),
     },
   }, async (request, reply) => {
@@ -22,7 +25,7 @@ export default async function visitRoutes(fastify: FastifyInstance) {
       return reply.code(204).send();
     }
 
-    const { path } = request.body as any;
+    const { path, device } = request.body as any;
 
     let userId: string | undefined;
     const auth = request.headers.authorization;
@@ -70,6 +73,7 @@ export default async function visitRoutes(fastify: FastifyInstance) {
         lat: geo.lat,
         lon: geo.lon,
         userAgent,
+        device: device && typeof device === 'object' ? device : null,
       },
     });
 

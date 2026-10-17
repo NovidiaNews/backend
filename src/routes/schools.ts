@@ -70,6 +70,16 @@ export default async function schoolRoutes(fastify: FastifyInstance) {
 
       // Pre-fill RSPO data if available
       const rspoData = domainResult.rspoData;
+
+      // RSPO number and the school's phone number are mandatory.
+      const resolvedRspo = rspoNumber || rspoData?.rspoNumber;
+      if (!resolvedRspo) {
+        return reply.status(400).send({ message: 'Numer RSPO jest wymagany.', field: 'rspoNumber' });
+      }
+      if (!phoneNumber || !String(phoneNumber).trim()) {
+        return reply.status(400).send({ message: 'Numer telefonu szkoły jest wymagany.', field: 'phoneNumber' });
+      }
+
       const hashed = await hashPassword(password);
       const code = generateVerificationCode();
       const expires = new Date(Date.now() + 15 * 60 * 1000);
@@ -83,7 +93,7 @@ export default async function schoolRoutes(fastify: FastifyInstance) {
           city: city || rspoData?.city || null,
           address: address || rspoData?.address || null,
           postalCode: postalCode || rspoData?.postalCode || null,
-          rspoNumber: rspoNumber || rspoData?.rspoNumber || null,
+          rspoNumber: resolvedRspo,
           website: website || rspoData?.website || null,
           voivodeship: voivodeship || rspoData?.voivodeship || null,
           consentToTOS: consent,
@@ -93,7 +103,10 @@ export default async function schoolRoutes(fastify: FastifyInstance) {
         },
       });
 
-      await sendVerificationEmail(email, code);
+      const sent = await sendVerificationEmail(email, code);
+      if (!sent) {
+        return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+      }
 
       return {
         status: 'needs_verification',
@@ -256,7 +269,10 @@ export default async function schoolRoutes(fastify: FastifyInstance) {
       data: { verificationCode: code, verificationCodeExpires: expires },
     });
 
-    await sendVerificationEmail(email, code);
+    const sent = await sendVerificationEmail(email, code);
+    if (!sent) {
+      return reply.status(502).send({ message: 'Nie udało się wysłać wiadomości e-mail. Spróbuj ponownie później.' });
+    }
 
     return {
       status: 'success',
